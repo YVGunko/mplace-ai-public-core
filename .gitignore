@@ -6,7 +6,6 @@ node_modules/
 *.swp
 *.swo
 *.swx
-*.json
 /config/*
 /src/generated/prisma
 .env
