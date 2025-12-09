@@ -1,405 +1,196 @@
-# Архитектура mplace-ai-public-core
+# Architecture.md — Mplace AI Public Core Architecture
 
-Этот репозиторий содержит **открытое ядро (core)** для AI-обработки товарных данных.  
-Цель — предложить универсальные типы, контракты и чистые функции, независимые от конкретных маркетплейсов (Ozon, Wildberries, Amazon, Shopify и т.п.).
+## Overview
 
-Пакет предназначен для:
+Mplace AI Public Core — модульное ядро для AI-обработки товарных данных маркетплейсов.
+Оно предоставляет унифицированные типы, контракты, абстракции пайплайнов и чистые функции анализа контента.
 
-- разработчиков платформ, работающих с товарами;
-- интеграторов AI-генерации;
-- разработчиков собственных marketplace-адаптеров;
-- авторов внутренних инструментов и пайплайнов массовой обработки.
+Public Core *не содержит*:
+- привязки к конкретным маркетплейсам,
+- промптов,
+- баз данных,
+- логики биллинга,
+- авторизации,
+- API ключей.
 
-`mplace-ai-public-core` не содержит реализаций маркетплейсов, production-промптов или ключей моделей — всё это живёт в приватных репозиториях проекта.
+Все конкретные интеграции находятся в Private Repo, который подключается через адаптеры.
 
----
-
-# 1. Обзор архитектуры
-
-Основные элементы:
-
-- **packages/core** — типы и чистые функции:
-  - товары, контент-рейтинг, снимки данных (snapshots);
-  - структура задач (jobs, job items);
-  - абстракции пайплайнов и адаптеров;
-  - планировщик улучшений (`buildPlannedImprovementsFromRating`);
-  - решение о запуске rich-контента (`shouldRunRich`).
-
-- **packages/job-engine-demo** — лёгкий демонстрационный движок:
-  - in-memory очередь;
-  - планирование улучшений;
-  - шаги AI-обработки (на mock-клиенте).
-
-Ни один модуль не содержит:
-
-- API ключей,
-- URL маркетплейсов,
-- схем БД продавцов,
-- production-промптов,
-- конфигурации реальных моделей.
-
-Все реальные адаптеры подключаются через интерфейсы, определённые в core.
-
----
-
-# 2. Общая архитектурная схема
+## 1. High-Level Architecture
 
 ```mermaid
 flowchart TD
-    UI[Ваше приложение / worker] --> Core[packages/core]
+    UI[Ваше приложение / Worker] --> Core[packages/core]
     Core --> Types[Типы и контракты]
-    Core --> Logic[Чистые функции улучшений]
-    Core --> Pipeline[Пайплайн-абстракции]
-    Core --> Adapters[Интерфейсы MarketplaceAdapter / AiClient]
+    Core --> Logic["Чистые функции
+(buildPlannedImprovements)"]
+    Core --> Pipeline[Абстракции пайплайна]
+    Core --> AdapterContracts[Интерфейсы MarketplaceAdapter / AiClient]
 
     Demo[job-engine-demo] --> Core
     Demo --> WorkerDemo[Demo Worker]
 
-    subgraph Private Repo [Ваше использование]
+    subgraph PrivateRepo["Private Repo — Ваше использование"]
         MPAdapter[Marketplace Adapter]
         AIClient[AI Client]
-        PrivateLogic[Правила улучшений, промпты]
+        PrivateLogic[Промпты, правила улучшений]
     end
 
-    Adapters --> MPAdapter
-    Adapters --> AIClient
+    AdapterContracts --> MPAdapter
+    AdapterContracts --> AIClient
+```
 
-## 3. Пакет `packages/core`
+## 2. Пакет packages/core
 
-### 3.1 Типы продукта (`types/product.ts`)
+Пакет содержит чистые доменные модели и расширяемые контракты, не привязанные к конкретному маркетплейсу.
 
-- `ProductRef` — универсальная ссылка на товар:
+### 2.1 Типы продукта (types/product.ts)
 
-  ```ts
-  interface ProductRef {
-    productId: string;  // internal stable ref (required)
-    sku?: string | number;
-    externalId?: string | number;
-  }
+#### ProductRef
 
-ProductSnapshot — снимок товара для AI‑пайплайна:
+```ts
+interface ProductRef {
+  id: string;
+  sku?: string | number;
+}
+```
 
+#### ProductSnapshot
+
+```ts
 interface ProductSnapshot {
   ref: ProductRef;
   text?: {
     name?: string;
     brand?: string;
     annotation?: string;
-    richContent?: unknown;
+    richContentJson?: unknown;
   };
   media?: {
     images?: string[];
     videos?: string[];
-    [key: string]: unknown;
   };
   attributes?: Record<string, unknown>;
   hashtags?: string[] | null;
   rating?: RatingEntry | null;
   extra?: Record<string, unknown>;
 }
-interface RatingEntry {
-  rating: number | null; //общая оценка rating
-  groups?: RatingGroup[]; //группы (media, text, attributes и т.п.) с весами и условиями;
-}
+```
 
-interface RatingGroup {
-  key: string;
-  rating?: number | null;
-  weight?: number;
-  conditions?: RatingCondition[];
-  improveAttributes?: string[];
-}
+### 2.2 Типы задач (types/job.ts)
 
-type RatingCondition = Record<string, unknown>;
+#### JobPayload
 
-type ImprovementType =
-  | "rich_content"
-  | "annotation"
-  | "name"
-  | "media"
-  | "attributes"
-  | "hashtags";
-
-type ImprovementReason =
-  | "low_rating"
-  | "missing_fields"
-  | "insufficient_media"
-  | "strategy_rule"
-  | "manual_override";
-
-interface PlannedImprovements {
-  text?: {
-    richContent?: {
-      type: "rich_content";
-      shouldGenerate: boolean;
-      reason?: ImprovementReason;
-      targetScoreDelta?: number;
-    };
-    annotation?: {
-      type: "annotation";
-      shouldExtend: boolean;
-      reason?: ImprovementReason;
-      targetLength?: number;
-    };
-  };
-  name?: {
-    type: "name";
-    shouldGenerate: boolean;
-    reason?: ImprovementReason;
-    maxLength?: number;
-  };
-  media?: {
-    type: "media";
-    needsMoreImages?: boolean;
-    reason?: ImprovementReason;
-    targetImages?: number;
-  };
-  attributes?: {
-    type: "attributes";
-    important?: Record<string, unknown>;
-    other?: Record<string, unknown>;
-  };
-  hashtags?: {
-    type: "hashtags";
-    shouldGenerate?: boolean;
-    reason?: ImprovementReason;
-  };
-
-  totalExpectedGain?: number;
-}
-
-
-3.2 Типы задач (types/job.ts)
-JobKind — тип задачи (например, rating-improve, ai-generate, data-refresh).
-
-JobStatus — состояние (pending, running, completed, failed, cancelled, paused).
-
-JobPayload:
-
+```ts
 interface JobPayload {
   version: number;
   kind: JobKind;
   target?: Record<string, unknown>;
-  plan?: Record<string, unknown>;
+  plan?: PlannedJobPlan;
   metadata?: Record<string, unknown>;
 }
-JobItemInputSnapshot — данные о конкретном товаре в момент постановки в очередь:
+```
 
+#### JobItemInputSnapshot
+
+```ts
 interface JobItemInputSnapshot {
   product?: ProductSnapshot;
   ratingAtEnqueue?: number | null;
   ratingEntry?: unknown;
   plannedImprovements?: PlannedImprovements;
 }
+```
 
-interface CoreError {
-  code: string;
-  message: string;
-  details?: unknown;
-}
+#### JobItemResultSnapshot
 
-interface MarketplaceResponse {
-  [key: string]: unknown;
-}
+Описание результата обработки товара.
 
-interface JobItemResultSnapshot {
-  success: boolean;
-  error?: CoreError;
-  aiOutputs?: Record<string, unknown>;
-  marketplaceResponse?: MarketplaceResponse;
-  metrics?: {
-    latencyMs?: number;
-    tokensIn?: number;
-    tokensOut?: number;
-  };
-}
+### 2.3 Пайплайны (types/pipeline.ts)
 
-3.3 Пайплайн (types/pipeline.ts)
-PipelineContext — контекст выполнения шага:
+#### PipelineContext
 
+```ts
 interface PipelineContext {
   jobId: string;
   itemId: string;
   now: () => Date;
   deps?: Record<string, unknown>;
 }
+```
 
-interface PipelineTrace {
-  step: string;
-  input: unknown;
-  output?: unknown;
-  error?: string;
-}
+#### PipelineStep
 
-interface PipelineResult {
-  success: boolean;
-  error?: CoreError;
-  changes?: Record<string, unknown>;
-  traces?: PipelineTrace[];
-}
+```ts
+async (ctx, snapshot) => PipelineResult
+```
 
-type PipelineStep =
-  (ctx: PipelineContext, snapshot: JobItemInputSnapshot)
-    => Promise<PipelineResult>;
+### 2.4 Адаптеры (types/adapter.ts)
 
-3.4 Адаптеры (types/adapter.ts)
-MarketplaceAuth — произвольный набор полей для авторизации (определяется приватным кодом).
+#### MarketplaceAdapter
 
-MarketplaceAdapter:
-
+```ts
 interface MarketplaceAdapter {
-  readonly name: string;
-  fetchProductSnapshot(ref: { id: string; sku?: string | number }): Promise<unknown>;
+  name: string;
+
+  fetchProductSnapshot(ref: ProductRef): Promise<ProductSnapshot>;
+
   applyProductChanges(
-    ref: { id: string; sku?: string | number },
+    ref: ProductRef,
     changes: Record<string, unknown>
   ): Promise<unknown>;
 }
-AiClient — общий контракт для AI‑клиента:
+```
 
+#### AiClient
+
+```ts
 interface AiClient {
-  readonly provider: string;
-  generate(mode: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  provider: string;
+  generate(
+    mode: string,
+    payload: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
 }
-Реализации этих интерфейсов (Ozon, WB, OpenAI, Groq и т.п.) находятся в приватных репозиториях.
+```
 
-4. Логика улучшений (logic/improvements.ts)
-buildPlannedImprovementsFromRating(rating, product, options):
+### 2.5 Чистая логика улучшений
 
-чистая функция;
-function buildPlannedImprovementsFromRating(
-  rating: RatingEntry,
-  product: ProductSnapshot,
-  options: { targetRating: number }
-): PlannedImprovements
+#### buildPlannedImprovementsFromRating
 
-function shouldRunRich(
-  jobPayload: JobPayload,
-  input: JobItemInputSnapshot
-): boolean
+Чистая функция анализа рейтинга и генерации улучшений.
 
-5. Demo job‑engine (packages/job-engine-demo)
-5.1 Схема работы demo-воркера
-sequenceDiagram
-    participant User
-    participant DemoEngine
-    participant Core
+#### shouldRunRich
 
-    User->>DemoEngine: enqueueDemoJob(items)
-    DemoEngine->>Core: buildPlannedImprovementsFromRating()
-    DemoEngine->>DemoEngine: create pending JobItems
+Решает, запускать ли rich-content генерацию.
 
-    User->>DemoEngine: runDemoWorkerOnce()
-    DemoEngine->>Core: shouldRunRich()
-    Core-->>DemoEngine: true/false
+## 3. Demo Job Engine (packages/job-engine-demo)
 
-    alt skip
-        DemoEngine->>DemoEngine: mark skipped
-    else run
-        DemoEngine->>DemoEngine: mock AI generation
-        DemoEngine->>DemoEngine: mark done
-    end
-5.1 Цель
-Показать, как можно:
+Минимальный демонстрационный движок.
 
-сформировать задачу с набором товаров;
-построить plannedImprovements на основе рейтинга;
-решить, какие элементы реально нужно отправлять в AI/маркетплейс.
-Demo‑engine не использует БД, Next.js или реальные API.
+### Demo Flow
 
-3.2 simpleJobEngine.js
-Функции:
+```mermaid
+flowchart TD
+    Enq[enqueueDemoJob] --> InMem[JobsInMemory]
+    Worker[runDemoWorkerOnce] --> InMem
+    Worker --> Logic["buildPlannedImprovements / shouldRunRich"]
+    Logic --> MockAI[MockAIGenerator]
+    MockAI --> Results[ResultSaved]
+```
 
-enqueueDemoJob({ items, ratingEntries }):
+## 4. Что не входит в public-core
 
-создаёт в памяти объект job с типом ai-rich и payload.kind = 'rating-improve';
-для каждого productRef:
-находит RatingEntry по sku или id;
-строит ProductSnapshot;
-вызывает buildPlannedImprovementsFromRating(...);
-создаёт jobItem со статусом pending и inputSnapshot.plannedImprovements.
-runDemoWorkerOnce():
+Public-core НЕ содержит:
+- реализации marketplace API
+- sellerId / enterpriseId / profileId
+- биллинг
+- Prisma
+- реальных AI моделей
 
-берёт все jobItems со статусом pending;
-для каждого:
-смотрит на job.payload и item.inputSnapshot;
-решает через shouldRunRich(...), нужно ли запускать rich‑генерацию;
-если нет → ставит статус skipped, записывает resultSnapshot.extra.skippedByPlan = true;
-если да → ставит статус done и кладёт в resultSnapshot.aiOutputs.richContent тестовые данные.
-Это простой пример того, как поверх core можно строить собственный движок с БД, очередями и настоящими AI‑клиентами.
+## 5. Roadmap
 
-5. Demo job-engine
-
-Небольшой демонстрационный worker, который показывает:
-
-как формировать задачи,
-
-как строить plannedImprovements,
-
-как решать, запускать ли rich-пайплайн,
-
-как обновлять статус JobItem.
-
-Mermaid-схема demo-воркера
-sequenceDiagram
-    participant User
-    participant DemoEngine
-    participant Core
-
-    User->>DemoEngine: enqueueDemoJob(items)
-    DemoEngine->>Core: buildPlannedImprovementsFromRating()
-    DemoEngine->>DemoEngine: create JobItems (pending)
-
-    User->>DemoEngine: runDemoWorkerOnce()
-    DemoEngine->>Core: shouldRunRich()
-    Core-->>DemoEngine: true/false
-
-    alt skip
-        DemoEngine->>DemoEngine: mark skipped
-    else run
-        DemoEngine->>DemoEngine: mock AI generation
-        DemoEngine->>DemoEngine: mark done
-    end
-
-Demo‑engine предназначен только для демонстрационных целей и не должен использоваться как production queue.
-
-6. Пример использования
-import {
-  buildPlannedImprovementsFromRating,
-  shouldRunRich
-} from "mplace-ai-public-core";
-
-const planned = buildPlannedImprovementsFromRating(ratingEntry, snapshot, {
-  targetRating: 80,
-});
-
-const inputSnapshot = {
-  product: snapshot,
-  ratingAtEnqueue: ratingEntry.rating,
-  ratingEntry,
-  plannedImprovements: planned,
-};
-
-if (shouldRunRich(job.payload, inputSnapshot)) {
-  // вызвать ваш AI-клиент и marketplace-адаптер
-} else {
-  // пропустить товар
-}
-
-7. Ограничения и расширение
-Репозиторий не содержит:
-
-привязки к конкретным маркетплейсам;
-реализаций адаптеров;
-production‑промптов или ключей моделей;
-Next.js API / React‑кода.
-Предполагается, что:
-
-приватные репозитории реализуют MarketplaceAdapter и AiClient;
-хранят реальные Prisma‑схемы, креды, URL и промпты;
-используют mplace-ai-public-core как независимое ядро.
-Roadmap:
-
-добавить больше типов улучшений (media/attributes/hashtags);
-оформить пример с Prisma‑схемой Job/JobItem и CLI/HTTP демо;
-опубликовать пакет в npm или GitHub Packages.
+- улучшение типизации media/attributes/hashtags
+- пример адаптера marketplace
+- CLI worker
+- npm-публикация
+- интеграция Prisma примеров
