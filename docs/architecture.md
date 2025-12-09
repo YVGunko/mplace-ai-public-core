@@ -55,7 +55,7 @@ flowchart TD
     Demo[job-engine-demo] --> Core
     Demo --> WorkerDemo[Demo Worker]
 
-    subgraph Private Repo (Ваше использование)
+    subgraph Private Repo [Ваше использование]
         MPAdapter[Marketplace Adapter]
         AIClient[AI Client]
         PrivateLogic[Правила улучшений, промпты]
